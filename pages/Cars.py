@@ -210,67 +210,80 @@ if not filtered_df.empty:
         key="create_ann_car"
     )
 
-    # --- НОВА ПЕРЕВІРКА №1: Чи не знаходиться авто у процесі викупу? ---
+    # 1. ПЕРЕВІРКА: Чи не знаходиться авто у процесі викупу?
     active_buyback_query = """
     SELECT request_id, status FROM public."Buyback_Requests"
     WHERE car_id = %s AND status NOT IN ('completed', 'rejected');
     """
     active_buyback = run_query(active_buyback_query, (car_for_announcement,), fetch="one")
 
-    # --- НОВА ПЕРЕВІРКА №2: Чи не належить авто вже компанії? ---
-    owner_query = "SELECT u.email FROM public.\"Cars\" c JOIN public.\"Users\" u ON c.owner_id = u.user_id WHERE c.car_id = %s;"
-    owner_email = run_query(owner_query, (car_for_announcement,), fetch="one")[0]
+    # 2. ВИЗНАЧЕННЯ ВЛАСНИКА
+    owner_query = "SELECT u.user_id, u.email FROM public.\"Cars\" c JOIN public.\"Users\" u ON c.owner_id = u.user_id WHERE c.car_id = %s;"
+    owner_data = run_query(owner_query, (car_for_announcement,), fetch="one")
+
+    if not owner_data:
+        st.error("Власника авто не знайдено!")
+        st.stop()
+
+    owner_id, owner_email = owner_data
 
     if active_buyback:
         st.error(
-            f"Неможливо створити оголошення: автомобіль ID {car_for_announcement} знаходиться у процесі викупу (Заявка ID: {active_buyback[0]}, статус: '{active_buyback[1]}').")
-
-    elif owner_email == 'company@marketplace.com':
-        # Якщо власник - компанія, створюємо оголошення від її імені
-        st.info("Цей автомобіль належить компанії. Оголошення буде створено від імені компанії.")
-        with st.form("create_company_ann_form"):
-            car_data = filtered_df[filtered_df['car_id'] == car_for_announcement].iloc[0]
-            default_title = f"{car_data['brand']} {car_data['model']} {car_data['year']} року"
-            title = st.text_input("Заголовок оголошення", value=default_title)
-            price = st.number_input("Ціна продажу ($)", min_value=0, step=500)
-            description = st.text_area("Опис автомобіля")
-
-            # Отримуємо ID компанії
-            company_id = \
-            run_query("SELECT user_id FROM public.\"Users\" WHERE email = 'company@marketplace.com'", fetch="one")[0]
-
-            if st.form_submit_button("Опублікувати від імені компанії"):
-                run_query(
-                    """INSERT INTO public."Sale_Announcements" (car_id, seller_user_id, title, description, price, status) VALUES (%s, %s, %s, %s, %s, %s);""",
-                    (car_for_announcement, company_id, title, description, price, 'active'))
-                st.success("Оголошення від імені компанії успішно створено!")
-                st.cache_data.clear()
-                time.sleep(1)
-                st.rerun()
+            f"Неможливо створити оголошення: авто ID {car_for_announcement} у процесі викупу (Статус: '{active_buyback[1]}').")
 
     else:
-        # Стандартний процес створення оголошення від імені користувача
-        existing_ann = run_query(
-            'SELECT announcement_id FROM public."Sale_Announcements" WHERE car_id = %s AND status = %s',
-            (car_for_announcement, 'active'), fetch="one")
-        if existing_ann:
-            st.warning(
-                f"Для автомобіля ID {car_for_announcement} вже існує активне оголошення (ID: {existing_ann[0]}).")
-        else:
-            with st.form("create_ann_form"):
-                car_data = filtered_df[filtered_df['car_id'] == car_for_announcement].iloc[0]
-                default_title = f"{car_data['brand']} {car_data['model']} {car_data['year']} року"
-                title = st.text_input("Заголовок оголошення", value=default_title)
-                price = st.number_input("Ціна (USD)", min_value=0, step=500)
-                description = st.text_area("Опис автомобіля")
-                seller_id = run_query("SELECT owner_id FROM public.\"Cars\" WHERE car_id = %s", (car_for_announcement,),
-                                      fetch="one")[0]
+        # Визначаємо попередні дані (якщо оголошення вже було, підтягнемо ціну і опис)
+        prev_ad = run_query(
+            'SELECT title, description, price, status FROM public."Sale_Announcements" WHERE car_id = %s',
+            (car_for_announcement,), fetch="one")
 
-                if st.form_submit_button("Опублікувати оголошення"):
-                    run_query(
-                        """INSERT INTO public."Sale_Announcements" (car_id, seller_user_id, title, description, price, status) VALUES (%s, %s, %s, %s, %s, %s);""",
-                        (car_for_announcement, seller_id, title, description, price, 'active'))
-                    st.success(f"Оголошення для авто ID {car_for_announcement} успішно створено!")
-                    st.cache_data.clear()
-                    time.sleep(1)
+        # Логіка заголовка форми
+        if owner_email == 'company@marketplace.com':
+            st.info("Авто належить компанії. Продаж від імені компанії.")
+            is_company = True
+        else:
+            is_company = False
+
+        # Якщо оголошення вже активне - попередження
+        if prev_ad and prev_ad[3] == 'active':
+            st.warning(f"Увага! Для цього авто вже є АКТИВНЕ оголошення. Створення нового перезапише старе.")
+
+        with st.form("create_ann_form"):
+            car_row = filtered_df[filtered_df['car_id'] == car_for_announcement].iloc[0]
+
+            # Значення за замовчуванням (з попереднього оголошення або згенеровані)
+            def_title = prev_ad[0] if prev_ad else f"{car_row['brand']} {car_row['model']} {car_row['year']} року"
+            def_desc = prev_ad[1] if prev_ad else "Опис автомобіля..."
+            def_price = float(prev_ad[2]) if prev_ad else 10000.0
+
+            title = st.text_input("Заголовок оголошення", value=def_title)
+            price = st.number_input("Ціна (USD)", min_value=0.0, step=100.0, value=def_price)
+            description = st.text_area("Опис", value=def_desc)
+
+            submit_btn = st.form_submit_button("Опублікувати / Оновити оголошення")
+
+            if submit_btn:
+                try:
+                    # ВИПРАВЛЕННЯ: Використовуємо INSERT ... ON CONFLICT
+                    upsert_query = """
+                    INSERT INTO public."Sale_Announcements" 
+                    (car_id, seller_user_id, title, description, price, status, creation_date) 
+                    VALUES (%s, %s, %s, %s, %s, 'active', CURRENT_TIMESTAMP)
+                    ON CONFLICT (car_id) 
+                    DO UPDATE SET 
+                        title = EXCLUDED.title,
+                        description = EXCLUDED.description,
+                        price = EXCLUDED.price,
+                        status = 'active',
+                        seller_user_id = EXCLUDED.seller_user_id,
+                        creation_date = CURRENT_TIMESTAMP;
+                    """
+                    # seller_user_id беремо реального власника (компанія або людина)
+                    run_query(upsert_query, (car_for_announcement, owner_id, title, description, price))
+
+                    st.success(f"Оголошення для авто ID {car_for_announcement} успішно збережено!")
+                    time.sleep(1.5)
                     st.rerun()
+
+                except psycopg2.Error as e:
+                    st.error(f"Помилка бази даних: {e}")
