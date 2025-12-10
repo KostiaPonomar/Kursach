@@ -1,56 +1,72 @@
-# pages/5_🧑‍💼_Employees.py
 import streamlit as st
-from db_utils import run_query, get_db_connection
+from db_utils import run_query, log_action, get_db_connection
+from auth import make_hash  # <--- ПОТРІБНО ДЛЯ ПАРОЛІВ
+from navigation import make_sidebar
 import pandas as pd
 import psycopg2
 from faker import Faker
 import time
 
 st.set_page_config(page_title="Співробітники", layout="wide")
-st.title("🧑‍💼 Управління співробітниками")
 
-
-# --- ФУНКЦІЇ ДЛЯ РОБОТИ З ДАНИМИ ---
-@st.cache_data
-def load_employees_and_positions():
-    """Завантажує співробітників та довідник посад."""
-    employees_query = """
-    SELECT
-        e.employee_id, e.first_name, e.last_name, p.name AS position,
-        e.email, e.is_active
-    FROM public."Employees" e
-    JOIN public."Positions" p ON e.position_id = p.position_id
-    ORDER BY e.employee_id;
-    """
-    employees = run_query(employees_query, fetch="all")
-
-    positions_query = 'SELECT position_id, name FROM public."Positions";'
-    positions = run_query(positions_query, fetch="all")
-
-    return employees, positions
-
-
-# Завантажуємо дані
-employees_df, positions_df = load_employees_and_positions()
-if employees_df is None or positions_df is None:
-    st.error("Не вдалося завантажити дані про співробітників.")
+# --- 🔒 ЗАХИСТ ДОСТУПУ (Тільки Адмін) ---
+if 'user_id' not in st.session_state or st.session_state['user_id'] is None:
+    st.warning("Будь ласка, увійдіть в систему.")
+    st.switch_page("main.py")
     st.stop()
 
-# --- БІЧНА ПАНЕЛЬ: ФІЛЬТРИ, СОРТУВАННЯ, ПОШУК ---
-st.sidebar.header("Фільтри, сортування та пошук")
+if st.session_state['role'] != 'admin':
+    st.error("⛔ Немає доступу! Ця сторінка тільки для Адміністраторів.")
+    st.stop()
 
-# Пошук
-search_query = st.sidebar.text_input("Пошук (за email, ім'ям, прізвищем):")
+make_sidebar()
+# ---------------------------------------
 
-# Сортування
-sort_column = st.sidebar.selectbox(
-    "Сортувати за:",
-    options=["employee_id", "first_name", "last_name", "position", "email"],
-)
-sort_ascending = st.sidebar.toggle("За зростанням ", value=True)  # Пробіл в кінці для унікального ключа
+st.title("🧑‍💼 Управління персоналом")
 
-# Застосування фільтрів та сортування
+
+# --- ЗАВАНТАЖЕННЯ ДАНИХ ---
+@st.cache_data
+def load_data():
+    # Об'єднуємо Employees та Users, щоб бачити роль і телефон
+    employees_query = """
+    SELECT
+        e.employee_id, 
+        e.first_name, 
+        e.last_name, 
+        p.name AS position,
+        e.email, 
+        u.phone_number,
+        u.role,
+        e.is_active
+    FROM public."Employees" e
+    JOIN public."Positions" p ON e.position_id = p.position_id
+    LEFT JOIN public."Users" u ON e.email = u.email -- Зв'язок по Email
+    ORDER BY e.employee_id;
+    """
+    emp_df = run_query(employees_query, fetch="all")
+
+    pos_query = 'SELECT position_id, name FROM public."Positions";'
+    pos_df = run_query(pos_query, fetch="all")
+
+    return emp_df, pos_df
+
+
+employees_df, positions_df = load_data()
+
+if employees_df is None:
+    st.error("Помилка завантаження даних.")
+    st.stop()
+
+# --- 🎨 САЙДБАР: ФІЛЬТРИ ---
+st.sidebar.header("Фільтри та пошук")
+
+search_query = st.sidebar.text_input("🔍 Пошук (Ім'я / Email):")
+role_filter = st.sidebar.multiselect("Посада:", options=employees_df['position'].unique())
+status_filter = st.sidebar.radio("Статус:", ["Всі", "Активні", "Звільнені"])
+
 filtered_df = employees_df.copy()
+
 if search_query:
     mask = (
             filtered_df['first_name'].str.contains(search_query, case=False) |
@@ -59,93 +75,179 @@ if search_query:
     )
     filtered_df = filtered_df[mask]
 
-if not filtered_df.empty:
-    filtered_df.sort_values(by=sort_column, ascending=sort_ascending, inplace=True)
+if role_filter:
+    filtered_df = filtered_df[filtered_df['position'].isin(role_filter)]
 
+if status_filter == "Активні":
+    filtered_df = filtered_df[filtered_df['is_active'] == True]
+elif status_filter == "Звільнені":
+    filtered_df = filtered_df[filtered_df['is_active'] == False]
+
+# --- ВІДОБРАЖЕННЯ ---
 st.dataframe(filtered_df, use_container_width=True)
-st.info(f"Знайдено {len(filtered_df)} співробітників.")
+st.info(f"Знайдено співробітників: {len(filtered_df)}")
 
-if filtered_df.empty and not search_query:
-    st.stop()
+st.divider()
 
 # --- CRUD ОПЕРАЦІЇ ---
-st.header("CRUD Операції")
-operation = st.selectbox("Оберіть операцію:", ["Додати співробітника", "Оновити дані", "Видалити співробітника"])
+st.subheader("🛠️ Управління акаунтами")
+operation = st.selectbox("Оберіть дію:", ["Створити акаунт менеджера", "Редагувати дані", "Деактивувати (Звільнити)"])
 
-# === CREATE ===
-if operation == "Додати співробітника":
-    st.subheader("Додавання нового співробітника")
-    fake = Faker('uk_UA')
-    with st.form("create_employee_form", clear_on_submit=True):
-        first_name = st.text_input("Ім'я")
-        last_name = st.text_input("Прізвище")
-        email = st.text_input("Email")
+# ==========================================
+# === CREATE (USERS + EMPLOYEES) ===
+# ==========================================
+if operation == "Створити акаунт менеджера":
+    st.markdown("Ця форма створить **користувача для входу** та **картку співробітника** одночасно.")
+
+    # Генератор
+    if st.button("🎲 Згенерувати дані"):
+        fake = Faker('uk_UA')
+        st.session_state['new_emp'] = {
+            'first': fake.first_name(), 'last': fake.last_name(),
+            'email': fake.unique.email(), 'phone': fake.phone_number()
+        }
+
+    defaults = st.session_state.get('new_emp', {})
+
+    with st.form("create_employee"):
+        c1, c2 = st.columns(2)
+        first_name = c1.text_input("Ім'я", value=defaults.get('first', ''))
+        last_name = c2.text_input("Прізвище", value=defaults.get('last', ''))
+
+        c3, c4 = st.columns(2)
+        email = c3.text_input("Email", value=defaults.get('email', ''))
+        phone = c4.text_input("Телефон", value=defaults.get('phone', ''))
+
+        c5, c6 = st.columns(2)
+        password = c5.text_input("Пароль", type="password")
+        role_select = c6.selectbox("Роль доступу:", ["manager", "admin"])
+
         position_id = st.selectbox(
-            "Посада:",
+            "Посада (для відображення):",
             options=positions_df['position_id'],
             format_func=lambda x: positions_df.loc[positions_df['position_id'] == x, 'name'].iloc[0]
         )
-        is_active = st.checkbox("Активний", value=True)
 
-        if st.form_submit_button("Додати"):
-            if not all([first_name, last_name, email]):
-                st.error("Будь ласка, заповніть поля 'Ім'я', 'Прізвище' та 'Email'.")
+        if st.form_submit_button("Створити співробітника"):
+            if not all([first_name, last_name, email, password]):
+                st.error("Заповніть всі поля!")
             else:
                 try:
-                    run_query(
-                        'INSERT INTO public."Employees" (first_name, last_name, position_id, email, is_active) VALUES (%s, %s, %s, %s, %s);',
-                        (first_name, last_name, position_id, email, is_active)
-                    )
-                    st.success(f"Співробітника {first_name} {last_name} успішно додано!")
+                    hashed_pass = make_hash(password)
+
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cur:
+                            # 1. Створюємо (або оновлюємо) User
+                            cur.execute("""
+                                INSERT INTO public."Users" (first_name, last_name, email, phone_number, password_hash, role)
+                                VALUES (%s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (email) DO UPDATE SET 
+                                    role = EXCLUDED.role, password_hash = EXCLUDED.password_hash
+                                RETURNING user_id;
+                            """, (first_name, last_name, email, phone, hashed_pass, role_select))
+                            user_id = cur.fetchone()[0]
+
+                            # 2. Створюємо Employee
+                            cur.execute("""
+                                INSERT INTO public."Employees" (first_name, last_name, position_id, email, is_active) 
+                                VALUES (%s, %s, %s, %s, true)
+                                RETURNING employee_id;
+                            """, (first_name, last_name, position_id, email))
+                            emp_id = cur.fetchone()[0]
+
+                        conn.commit()
+
+                    log_action(st.session_state['user_id'], "INSERT", "Users/Employees", emp_id,
+                               f"Створено менеджера {email}")
+                    st.success(f"Акаунт створено! ID: {emp_id}. Можна входити.")
+
+                    if 'new_emp' in st.session_state: del st.session_state['new_emp']
+                    st.cache_data.clear()
+                    time.sleep(2)
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Помилка (можливо такий email вже є): {e}")
+
+# ==========================================
+# === UPDATE ===
+# ==========================================
+elif operation == "Редагувати дані":
+    emp_id = st.selectbox("Оберіть співробітника:", options=filtered_df['employee_id'])
+
+    if emp_id:
+        curr = employees_df[employees_df['employee_id'] == emp_id].iloc[0]
+
+        with st.form("update_employee"):
+            new_email = st.text_input("Email (Зміна Email змінить логін!)", value=curr['email'])
+            new_phone = st.text_input("Телефон", value=curr['phone_number'] if curr['phone_number'] else "")
+
+            # Знаходимо поточний індекс посади
+            pos_idx = 0
+            current_pos_rows = positions_df[positions_df['name'] == curr['position']]
+            if not current_pos_rows.empty:
+                pos_idx = list(positions_df['position_id']).index(current_pos_rows.iloc[0]['position_id'])
+
+            new_pos = st.selectbox("Посада:", options=positions_df['position_id'], index=pos_idx,
+                                   format_func=lambda x:
+                                   positions_df.loc[positions_df['position_id'] == x, 'name'].iloc[0])
+
+            new_role = st.selectbox("Роль доступу:", ["manager", "admin", "client"],
+                                    index=["manager", "admin", "client"].index(curr['role']) if curr['role'] else 0)
+
+            if st.form_submit_button("Зберегти зміни"):
+                try:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cur:
+                            # Оновлюємо Employees
+                            cur.execute("""
+                                UPDATE public."Employees" SET email=%s, position_id=%s 
+                                WHERE employee_id=%s
+                            """, (new_email, new_pos, emp_id))
+
+                            # Оновлюємо Users (синхронізація)
+                            cur.execute("""
+                                UPDATE public."Users" SET email=%s, phone_number=%s, role=%s 
+                                WHERE email=%s
+                            """, (new_email, new_phone, new_role,
+                                  curr['email']))  # Використовуємо старий email для пошуку юзера
+
+                        conn.commit()
+
+                    log_action(st.session_state['user_id'], "UPDATE", "Employees", int(emp_id),
+                               f"Оновлено дані для {new_email}")
+                    st.success("Дані оновлено!")
                     st.cache_data.clear()
                     time.sleep(1)
                     st.rerun()
-                except psycopg2.Error as e:
-                    st.error(f"Помилка бази даних: {e}")
+                except Exception as e:
+                    st.error(f"Помилка: {e}")
 
-# === UPDATE ===
-elif operation == "Оновити дані":
-    st.subheader("Оновити дані співробітника")
-    emp_to_update_id = st.selectbox("Оберіть ID співробітника для оновлення:", options=filtered_df['employee_id'])
-    current_data = employees_df[employees_df['employee_id'] == emp_to_update_id].iloc[0]
+# ==========================================
+# === DELETE (DEACTIVATE) ===
+# ==========================================
+elif operation == "Деактивувати (Звільнити)":
+    emp_id = st.selectbox("Оберіть співробітника:", options=filtered_df['employee_id'])
 
-    with st.form("update_employee_form"):
-        current_pos_id = positions_df[positions_df['name'] == current_data['position']].iloc[0]['position_id']
+    st.warning("Це забере доступ до системи, але збереже історію дій.")
 
-        new_email = st.text_input("Email", value=current_data['email'])
-        new_position_id = st.selectbox(
-            "Посада:",
-            options=positions_df['position_id'],
-            index=list(positions_df['position_id']).index(current_pos_id),  # Встановлюємо поточну посаду
-            format_func=lambda x: positions_df.loc[positions_df['position_id'] == x, 'name'].iloc[0]
-        )
-        new_is_active = st.checkbox("Активний", value=current_data['is_active'])
-
-        if st.form_submit_button("Оновити"):
-            run_query(
-                'UPDATE public."Employees" SET email = %s, position_id = %s, is_active = %s WHERE employee_id = %s;',
-                (new_email, new_position_id, new_is_active, emp_to_update_id)
-            )
-            st.success(f"Дані для співробітника ID {emp_to_update_id} оновлено!")
-            st.cache_data.clear()
-            time.sleep(1)
-            st.rerun()
-
-# === DELETE ===
-elif operation == "Видалити співробітника":
-    st.subheader("Видалити співробітника")
-    emp_to_delete_id = st.selectbox("Оберіть ID співробітника для видалення:", options=filtered_df['employee_id'])
-
-    st.warning(
-        f"Увага! Співробітник ID {emp_to_delete_id} буде видалений. Це може вплинути на історичні дані в заявках та інспекціях.")
-
-    if st.button("Видалити"):
+    if st.button("🚫 Заблокувати доступ"):
         try:
-            # В базі для manager_id та inspector_id має стояти ON DELETE SET NULL, щоб це працювало
-            run_query('DELETE FROM public."Employees" WHERE employee_id = %s;', (emp_to_delete_id,))
-            st.success(f"Співробітника ID {emp_to_delete_id} видалено!")
+            curr_email = employees_df[employees_df['employee_id'] == emp_id].iloc[0]['email']
+
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    # 1. Ставимо is_active = False в Employees
+                    cur.execute('UPDATE "Employees" SET is_active=false WHERE employee_id=%s', (emp_id,))
+                    # 2. Змінюємо роль на 'client' в Users (щоб не міг зайти в адмінку)
+                    cur.execute('UPDATE "Users" SET role=\'client\' WHERE email=%s', (curr_email,))
+
+                conn.commit()
+
+            log_action(st.session_state['user_id'], "DEACTIVATE", "Employees", int(emp_id), "Звільнення співробітника")
+            st.success("Співробітника деактивовано.")
             st.cache_data.clear()
             time.sleep(1)
             st.rerun()
-        except psycopg2.Error as e:
-            st.error(f"Помилка видалення: {e}. Перевірте, чи не призначений цей співробітник на активні заявки.")
+        except Exception as e:
+            st.error(f"Помилка: {e}")
