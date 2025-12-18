@@ -9,7 +9,7 @@ from datetime import datetime
 # Ініціалізація додатку
 app = FastAPI(
     title="Car Marketplace API (Ultimate)",
-    description="Професійний API для інтеграції з партнерами, CRM та мобільними додатками.",
+    description="API для інтеграції з партнерами, CRM та мобільними додатками.",
     version="3.0.0"
 )
 

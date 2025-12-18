@@ -6,6 +6,7 @@ import time
 
 st.set_page_config(page_title="Мій Гараж", layout="wide")
 
+# --- 🔒 ЗАХИСТ ДОСТУПУ ---
 if 'user_id' not in st.session_state or st.session_state['user_id'] is None:
     st.warning("Будь ласка, увійдіть в систему.")
     st.switch_page("main.py")
@@ -17,6 +18,7 @@ CURRENT_USER = st.session_state['user_id']
 st.title(f"🚗 Гараж користувача {st.session_state['username']}")
 
 
+# --- ЗАВАНТАЖЕННЯ ДАНИХ ---
 @st.cache_data
 def load_my_data(uid):
     # 1. Мої авто
@@ -47,10 +49,18 @@ def load_my_data(uid):
     """
     my_requests = run_query(requests_query, (uid,), fetch="all")
 
-    # 3. Оголошення
+    # 3. Мої оголошення
     ads_query = """
-    SELECT sa.announcement_id, sa.car_id, sa.price, sa.status, sa.title
+    SELECT 
+        sa.announcement_id, 
+        sa.car_id, 
+        sa.price, 
+        sa.status, 
+        b.name || ' ' || m.name || ' (' || c.year || ')' AS car_name
     FROM public."Sale_Announcements" sa
+    JOIN public."Cars" c ON sa.car_id = c.car_id
+    JOIN public."Models" m ON c.model_id = m.model_id
+    JOIN public."Brands" b ON m.brand_id = b.brand_id
     WHERE sa.seller_user_id = %s AND sa.status = 'active';
     """
     my_ads = run_query(ads_query, (uid,), fetch="all")
@@ -87,7 +97,7 @@ with st.expander("Натисніть, щоб додати авто"):
 
         if st.form_submit_button("Надіслати на перевірку"):
             if not all([brand, model, vin]) or len(vin) != 17:
-                st.error("Некоректні дані.")
+                st.error("Некоректні дані (VIN має бути 17 символів).")
             else:
                 try:
                     with get_db_connection() as conn:
@@ -136,81 +146,80 @@ if cars_df is not None and not cars_df.empty:
     st.write("⚡ **Дії з вибраним авто:**")
 
 
+    # --- ВИПРАВЛЕННЯ: Унікальні назви для списку ---
     def fmt_car(cid):
         row = cars_df[cars_df['car_id'] == cid].iloc[0]
         st_icon = {"verified": "✅", "pending": "⏳", "rejected": "❌"}
-        return f"{st_icon.get(row['verification_status'], '')} {row['title']}"
+        # Додаємо ID, щоб ідентифікувати однакові моделі
+        return f"{st_icon.get(row['verification_status'], '')} {row['title']} (ID: {cid})"
 
 
     sel_car = st.selectbox("Оберіть авто зі списку:", options=cars_df['car_id'], format_func=fmt_car)
+
+    # --- ПРЯМА ПЕРЕВІРКА В БД ---
+    p2p_check = run_query(
+        'SELECT announcement_id FROM "Sale_Announcements" WHERE car_id=%s AND status=\'active\'',
+        (int(sel_car),), fetch="one"
+    )
+    on_p2p = p2p_check is not None
+
+    trade_check = run_query(
+        'SELECT request_id FROM "Buyback_Requests" WHERE car_id=%s AND status NOT IN (\'completed\', \'rejected\')',
+        (int(sel_car),), fetch="one"
+    )
+    on_tradein = trade_check is not None
+
     car_row = cars_df[cars_df['car_id'] == sel_car].iloc[0]
     status = car_row['verification_status']
 
-    # --- VERIFIED ---
+    # --- ВІДОБРАЖЕННЯ СТАТУСУ ---
+    if on_p2p:
+        st.info(f"📢 Це авто (ID {sel_car}) зараз продається на сайті (P2P).")
+    if on_tradein:
+        st.info(f"🔄 Подано заявку на Trade-in для авто ID {sel_car}.")
+
+    # --- ЛОГІКА ДІЙ ---
     if status == 'verified':
-        st.success("Авто верифіковано. Доступні операції продажу.")
         c1, c2 = st.columns(2)
 
-        # --- БЛОК P2P ПРОДАЖУ ---
+        # P2P
         with c1:
-            with st.popover("📢 Продати на сайті (P2P)"):
-                # 1. Перевірка на Trade-in
-                active_buyback = run_query(
-                    'SELECT request_id FROM "Buyback_Requests" WHERE car_id=%s AND status NOT IN (\'completed\', \'rejected\')',
-                    (sel_car,), fetch="one")
-                # 2. Перевірка на P2P (чи вже є?)
-                active_ad = run_query(
-                    'SELECT announcement_id FROM "Sale_Announcements" WHERE car_id=%s AND status=\'active\'',
-                    (sel_car,), fetch="one")
-
-                if active_buyback:
-                    st.error(
-                        f"⛔ Ви не можете створити оголошення, бо це авто вже в процесі викупу компанією (Заявка ID {active_buyback[0]}).")
+            with st.popover("📢 Продати на сайті (P2P)", disabled=on_tradein):
+                if on_tradein:
+                    st.error("Авто на етапі викупу.")
                 else:
-                    if active_ad:
-                        st.info(
-                            "ℹ️ У вас вже є активне оголошення для цього авто. Натискання 'Опублікувати' оновить ціну та опис.")
+                    btn_text = "Оновити оголошення" if on_p2p else "Опублікувати"
+                    st.write(btn_text)
+                    p_price = st.number_input("Ціна продажу ($):", min_value=500.0, step=100.0, key=f"p2p_p_{sel_car}")
+                    p_desc = st.text_area("Опис:", placeholder="Не бита...", key=f"p2p_d_{sel_car}")
 
-                    st.write("Створити/Оновити оголошення")
-                    p_price = st.number_input("Ціна продажу ($):", min_value=500.0, step=100.0)
-                    p_desc = st.text_area("Опис:", placeholder="Не бита, не фарбована...")
-
-                    if st.button("Опублікувати"):
+                    if st.button(btn_text, key=f"p2p_btn_{sel_car}"):
                         try:
                             run_query("""
                                 INSERT INTO "Sale_Announcements" (car_id, seller_user_id, title, description, price, status)
                                 VALUES (%s, %s, %s, %s, %s, 'active')
                                 ON CONFLICT (car_id) DO UPDATE SET price=EXCLUDED.price, description=EXCLUDED.description, status='active';
                             """, (sel_car, CURRENT_USER, car_row['title'], p_desc, p_price), commit=True)
+
                             log_action(CURRENT_USER, "INSERT", "Sale_Announcements", None, f"Оголошення: {sel_car}")
-                            st.success("Опубліковано!")
+                            st.success("Готово!")
                             st.cache_data.clear()
                             time.sleep(1)
                             st.rerun()
                         except Exception as e:
                             st.error(f"Помилка: {e}")
 
-        # --- БЛОК TRADE-IN ---
+        # Trade-in
         with c2:
-            with st.popover("🔄 Продати компанії (Trade-in)"):
-                # 1. Перевірка на Trade-in
-                exists_req = run_query(
-                    'SELECT request_id FROM "Buyback_Requests" WHERE car_id=%s AND status NOT IN (\'completed\', \'rejected\')',
-                    (sel_car,), fetch="one")
-                # 2. Перевірка на P2P
-                exists_ann = run_query(
-                    'SELECT announcement_id FROM "Sale_Announcements" WHERE car_id=%s AND status=\'active\'',
-                    (sel_car,), fetch="one")
-
-                if exists_ann:
-                    st.error(
-                        "⛔ Це авто виставлено на продаж у P2P. Ви не можете подати заявку на викуп. Спочатку зніміть оголошення (в архів).")
-                elif exists_req:
-                    st.error(f"⛔ У вас вже є активна заявка на викуп (ID {exists_req[0]}). Не спамте :)")
+            with st.popover("🔄 Продати компанії (Trade-in)", disabled=(on_p2p or on_tradein)):
+                if on_p2p:
+                    st.error("Спочатку зніміть оголошення з продажу.")
+                elif on_tradein:
+                    st.error("Заявка вже активна.")
                 else:
-                    st.write("Подати заявку на викуп")
-                    t_price = st.number_input("Бажана ціна ($):", min_value=500.0, step=100.0)
-                    if st.button("Відправити заявку"):
+                    st.write("Подати заявку")
+                    t_price = st.number_input("Бажана ціна ($):", min_value=500.0, step=100.0, key=f"tr_p_{sel_car}")
+                    if st.button("Відправити заявку", key=f"tr_btn_{sel_car}"):
                         run_query(
                             'INSERT INTO "Buyback_Requests" (car_id, user_id, desired_price, status) VALUES (%s, %s, %s, \'new\')',
                             (sel_car, CURRENT_USER, t_price), commit=True)
@@ -222,14 +231,12 @@ if cars_df is not None and not cars_df.empty:
 
     # --- REJECTED ---
     elif status == 'rejected':
-        st.error(f"⛔ **Заявку відхилено!**")
-        st.markdown(f"**Причина:** {car_row['rejection_reason']}")
-
-        with st.expander("✏️ Виправити дані та подати знову", expanded=True):
-            with st.form("fix_car"):
+        st.error(f"⛔ **Заявку відхилено!** Причина: {car_row['rejection_reason']}")
+        with st.expander("✏️ Виправити дані та подати знову"):
+            with st.form(f"fix_car_{sel_car}"):
                 n_vin = st.text_input("VIN", value=car_row['vin_code'])
                 n_mileage = st.number_input("Пробіг", value=car_row['mileage'])
-                if st.form_submit_button("Відправити на повторну перевірку"):
+                if st.form_submit_button("Відправити повторно"):
                     run_query("""
                         UPDATE "Cars" SET vin_code=%s, mileage=%s, verification_status='pending', rejection_reason=NULL 
                         WHERE car_id=%s
@@ -242,8 +249,8 @@ if cars_df is not None and not cars_df.empty:
 
     # --- PENDING ---
     elif status == 'pending':
-        st.warning("⏳ Автомобіль знаходиться на перевірці у менеджера.")
-        if st.button("Скасувати заявку"):
+        st.warning("⏳ Автомобіль знаходиться на перевірці.")
+        if st.button("Скасувати заявку (Видалити)", key=f"del_pend_{sel_car}"):
             run_query('DELETE FROM "Cars" WHERE car_id=%s', (sel_car,), commit=True)
             st.success("Скасовано.");
             st.cache_data.clear();
@@ -251,12 +258,12 @@ if cars_df is not None and not cars_df.empty:
             st.rerun()
 
 else:
-    st.info("Гараж порожній.")
+    st.info("У вас немає зареєстрованих автомобілів.")
 
 st.divider()
 
-# 3. СТАТУС ЗАЯВОК
-st.subheader("📥 Заявки Trade-in")
+# 3. TRADE-IN ЗАЯВКИ
+st.subheader("📥 Статус заявок на викуп")
 if req_df is not None and not req_df.empty:
     for _, row in req_df.iterrows():
         with st.expander(f"{row['car_name']} (Статус: {row['status'].upper()})"):
@@ -282,9 +289,9 @@ else:
 
 st.divider()
 
-# 4. ОГОЛОШЕННЯ
-st.subheader("📢 Мої оголошення")
+# 4. МОЇ ОГОЛОШЕННЯ
+st.subheader("📢 Мої активні оголошення")
 if ads_df is not None and not ads_df.empty:
-    st.dataframe(ads_df[['title', 'price', 'status']], use_container_width=True)
+    st.dataframe(ads_df[['car_name', 'price', 'status']], use_container_width=True)
 else:
     st.caption("Немає оголошень.")

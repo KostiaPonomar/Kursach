@@ -99,13 +99,6 @@ operation = st.selectbox("Оберіть дію:", ["Створити акаун
 if operation == "Створити акаунт менеджера":
     st.markdown("Ця форма створить **користувача для входу** та **картку співробітника** одночасно.")
 
-    # Генератор
-    if st.button("🎲 Згенерувати дані"):
-        fake = Faker('uk_UA')
-        st.session_state['new_emp'] = {
-            'first': fake.first_name(), 'last': fake.last_name(),
-            'email': fake.unique.email(), 'phone': fake.phone_number()
-        }
 
     defaults = st.session_state.get('new_emp', {})
 
